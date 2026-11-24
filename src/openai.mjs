@@ -233,23 +233,52 @@ async function handleCompletions (req, apiKey) {
   return new Response(body, fixCors(response));
 }
 
-const adjustProps = (schemaPart) => {
-  if (typeof schemaPart !== "object" || schemaPart === null) {
+// Gemini 的 function_declarations.parameters 只接受 JSON Schema 的一个小字集，
+// 出现未知字段（$schema / additionalProperties / anyOf / const / title / default /
+// examples / minimum ...）就直接 400 "Unknown name"。MCP / Claude Code 等客户端
+// 的 strict tool schema 几乎必带这些，所以这里按白名单递归清洗，只保留：
+// type / properties / required / items / enum / description / format / propertyOrdering
+// （oneOf 是 Gemini 唯一支持的组合关键字，anyOf/allOf 合并进它）。
+const SCHEMA_ALLOWED_KEYS = new Set([
+  "type", "properties", "required", "items", "enum", "description", "format", "propertyOrdering",
+]);
+const sanitizeSchema = (node) => {
+  if (typeof node !== "object" || node === null) return;
+  if (Array.isArray(node)) {
+    node.forEach(sanitizeSchema);
     return;
   }
-  if (Array.isArray(schemaPart)) {
-    schemaPart.forEach(adjustProps);
-  } else {
-    if (schemaPart.type === "object" && schemaPart.properties && schemaPart.additionalProperties === false) {
-      delete schemaPart.additionalProperties;
-    }
-    Object.values(schemaPart).forEach(adjustProps);
+  // anyOf/allOf 合并成 oneOf
+  if (node.anyOf || node.allOf) {
+    node.oneOf = [...(node.oneOf || []), ...(node.anyOf || []), ...(node.allOf || [])];
   }
+  for (const k of Object.keys(node)) {
+    if (k !== "oneOf" && !SCHEMA_ALLOWED_KEYS.has(k)) delete node[k];
+  }
+  if (node.oneOf) {
+    if (node.oneOf.length === 1) {
+      // 单分支 oneOf 没有约束意义，摊平后按普通 schema 继续洗
+      const only = node.oneOf[0];
+      if (only && typeof only === "object") sanitizeSchema(only);
+      for (const k of Object.keys(node)) delete node[k];
+      if (only && typeof only === "object") Object.assign(node, only);
+    } else {
+      // 多分支：只洗分支，节点自身关键字已在上面处理完
+      node.oneOf.forEach(sanitizeSchema);
+      return;
+    }
+  }
+  // 按位置递归（properties 的键名是字段名不是关键字，不能整体洗）
+  if (node.properties && typeof node.properties === "object") {
+    for (const v of Object.values(node.properties)) sanitizeSchema(v);
+  }
+  if (node.items) sanitizeSchema(node.items);
 };
 const adjustSchema = (schema) => {
   const obj = schema[schema.type];
   delete obj.strict;
-  return adjustProps(schema);
+  if (obj.parameters) sanitizeSchema(obj.parameters);
+  return obj;
 };
 
 const harmCategory = [
